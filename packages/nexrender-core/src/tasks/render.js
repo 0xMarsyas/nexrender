@@ -3,7 +3,7 @@ const path = require('path')
 const {spawn} = require('child_process')
 const {expandEnvironmentVariables, checkForWSL} = require('../helpers/path')
 
-const progressRegex = /([\d]{1,2}:[\d]{2}:[\d]{2}:[\d]{2})\s+(\(\d+\))/gi;
+const progressRegex = /([\d]{1,2}:[\d]{2}:[\d]{2}:[\d]{2})\s+(\(\d+[UL]?\))/gi;
 const durationRegex = /Duration:\s+([\d]{1,2}:[\d]{2}:[\d]{2}:[\d]{2})/gi;
 const startRegex = /Start:\s+([\d]{1,2}:[\d]{2}:[\d]{2}:[\d]{2})/gi;
 const nexrenderErrorRegex = /Error:\s+(nexrender:.*)$/gim;
@@ -61,6 +61,9 @@ Estimated date of change to the new behavior: 2023-06-01.\n`);
     if (!settings.skipRender) {
         option(params, '-OMtemplate', job.template.outputModule);
         option(params, '-RStemplate', job.template.settingsTemplate);
+
+        option(params, '-renderSettings', job.template.renderSettings);
+        option(params, '-outputSettings', job.template.outputSettings);
 
         option(params, '-s', job.template.frameStart);
         option(params, '-e', job.template.frameEnd);
@@ -147,6 +150,28 @@ Estimated date of change to the new behavior: 2023-06-01.\n`);
         return data;
     }
 
+    settings.track('Job Render Started', {
+        job_id: job.uid, // anonymized internally
+        job_output_module: job.template.outputModule,
+        job_settings_template: job.template.settingsTemplate,
+        job_output_settings: job.template.outputSettings,
+        job_render_settings: job.template.renderSettings,
+        job_frame_start_set: job.template.frameStart !== undefined,
+        job_frame_end_set: job.template.frameEnd !== undefined,
+        job_frame_increment_set: job.template.frameIncrement !== undefined,
+        job_continue_on_missing: job.template.continueOnMissing,
+        job_image_sequence: job.template.imageSequence,
+        job_multi_frames: settings.multiFrames,
+        job_settings_reuse: settings.reuse,
+        job_settings_skip_render: settings.skipRender,
+        job_settings_stop_on_error: settings.stopOnError,
+        job_settings_skip_cleanup: settings.skipCleanup,
+        job_settings_max_memory_percent: !!settings.maxMemoryPercent,
+        job_settings_image_cache_percent: !!settings.imageCachePercent,
+        job_settings_aeparams_set: !!settings['aeParams'],
+        job_settings_max_render_timeout: settings.maxRenderTimeout,
+    })
+
     // spawn process and begin rendering
     return new Promise((resolve, reject) => {
         renderStopwatch = Date.now();
@@ -167,6 +192,7 @@ Estimated date of change to the new behavior: 2023-06-01.\n`);
 
         instance.on('error', err => {
             clearTimeout(timeoutID);
+            settings.trackSync('Job Render Failed', { job_id: job.uid, error: 'aerender_spawn_error' });
             return reject(new Error(`Error starting aerender process: ${err}`));
         });
 
@@ -184,6 +210,7 @@ Estimated date of change to the new behavior: 2023-06-01.\n`);
             const timeout = 1000 * settings.maxRenderTimeout;
             timeoutID = setTimeout(
                 () => {
+                    settings.trackSync('Job Render Failed', { job_id: job.uid, error: 'aerender_timeout' });
                     reject(new Error(`Maximum rendering time exceeded`));
                     instance.kill('SIGINT');
                 },
@@ -203,17 +230,30 @@ Estimated date of change to the new behavior: 2023-06-01.\n`);
                     settings.logger.log(fs.readFileSync(logPath, 'utf8'))
                 }
 
+                settings.trackSync('Job Render Failed', {
+                    job_id: job.uid, // anonymized internally
+                    exit_code: code,
+                    error: 'aerender_exit_code',
+                });
+
                 clearTimeout(timeoutID);
                 return reject(new Error(outputStr || 'aerender.exe failed to render the output into the file due to an unknown reason'));
             }
 
-            settings.logger.log(`[${job.uid}] rendering took ~${(Date.now() - renderStopwatch) / 1000} sec.`);
+            const renderTime = (Date.now() - renderStopwatch) / 1000
+            settings.logger.log(`[${job.uid}] rendering took ~${renderTime} sec.`);
             settings.logger.log(`[${job.uid}] writing aerender job log to: ${logPath}`);
 
             fs.writeFileSync(logPath, outputStr);
 
             /* resolve job without checking if file exists, or its size for image sequences */
             if (settings.skipRender || job.template.imageSequence || ['jpeg', 'jpg', 'png'].indexOf(outputFile) !== -1) {
+                settings.track('Job Render Finished', {
+                    job_id: job.uid, // anonymized internally
+                    job_finish_reason: 'skipped_check',
+                    job_render_time: renderTime,
+                })
+
                 clearTimeout(timeoutID);
                 return resolve(job)
             }
@@ -235,29 +275,30 @@ Estimated date of change to the new behavior: 2023-06-01.\n`);
                 defaultOutputs.shift();
             }
 
-            if (defaultOutputs.length === 0) {
-                clearTimeout(timeoutID);
-                return reject(new Error(`Output file not found: ${job.output}`));
-            }
-
-            job.output = defaultOutputs[0];
-
-            if (!fs.existsSync(job.output)) {
+            if (defaultOutputs.length === 0 || !fs.existsSync(defaultOutputs[0])) {
                 if (fs.existsSync(logPath)) {
                     settings.logger.log(`[${job.uid}] dumping aerender log:`)
                     settings.logger.log(fs.readFileSync(logPath, 'utf8'))
                 }
 
+                settings.trackSync('Job Render Failed', { job_id: job.uid, error: 'aerender_output_not_found' });
                 clearTimeout(timeoutID);
                 return reject(new Error(`Couldn't find a result file: ${outputFile}`))
             }
 
+            job.output = defaultOutputs[0];
             const stats = fs.statSync(job.output)
 
             /* file smaller than 1000 bytes */
             if (stats.size < 1000) {
                 settings.logger.log(`[${job.uid}] Warning: output file size is less than 1000 bytes (${stats.size} bytes), be advised that file is corrupted, or rendering is still being finished`)
             }
+
+            settings.track('Job Render Finished', {
+                job_id: job.uid, // anonymized internally
+                job_finish_reason: 'success',
+                job_render_time: renderTime,
+            });
 
             clearTimeout(timeoutID);
             resolve(job)
